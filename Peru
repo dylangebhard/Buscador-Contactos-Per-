@@ -1,0 +1,712 @@
+import logging
+import sys
+import time
+import json
+import os
+import csv
+import requests
+from datetime import datetime
+from urllib.parse import urlparse
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+
+class Logger:
+    def __init__(self):
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s - %(levelname)s - %(message)s",
+            handlers=[logging.StreamHandler(sys.stdout)]
+        )
+        self.logger = logging.getLogger(__name__)
+
+class WebDriverManager:
+    def __init__(self, logger):
+        self.logger = logger
+        self.driver = None
+
+    def setup_driver(self):
+        try:
+            options = webdriver.ChromeOptions()
+            options.add_argument("--start-maximized")
+            # options.add_argument("--headless")
+            self.driver = webdriver.Chrome(options=options)
+            self.logger.info("WebDriver inicializado exitosamente.")
+            return self.driver
+        except WebDriverException as e:
+            self.logger.error(f"Error al inicializar WebDriver: {e}")
+            sys.exit(1)
+
+    def quit(self):
+        if self.driver:
+            self.driver.quit()
+            self.logger.info("WebDriver cerrado.")
+
+class DataManager:
+    def __init__(self, logger):
+        self.logger = logger
+        self.fieldnames = [
+            "empresa", "expediente", "titulo", "fecha_acuerdo", 
+            "descripcion", "urls_documentos"
+        ]
+
+    def guardar_en_csv(self, hechos):
+        filename = "hechos_de_importancia.csv"
+        try:
+            # Leer registros existentes
+            existing_records = set()
+            try:
+                with open(filename, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        # Crear una clave única para cada registro
+                        record_key = f"{row['empresa']}_{row['expediente']}_{row['fecha_acuerdo']}"
+                        existing_records.add(record_key)
+            except FileNotFoundError:
+                # Si el archivo no existe, lo crearemos
+                pass
+
+            # Abrir el archivo en modo append
+            mode = 'a' if existing_records else 'w'
+            with open(filename, mode, newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+                
+                # Escribir el header solo si es un archivo nuevo
+                if not existing_records:
+                    writer.writeheader()
+                
+                # Escribir nuevos registros
+                new_records = 0
+                for hecho in hechos:
+                    record_key = f"{hecho['empresa']}_{hecho['expediente']}_{hecho['fecha_acuerdo']}"
+                    if record_key not in existing_records:
+                        urls_docs = "|".join([doc["url"] for doc in hecho["documentos"]])
+                        row = {
+                            "empresa": hecho["empresa"],
+                            "expediente": hecho["expediente"],
+                            "titulo": hecho["titulo"],
+                            "fecha_acuerdo": hecho["fecha_acuerdo"],
+                            "descripcion": hecho["descripcion"],
+                            "urls_documentos": urls_docs
+                        }
+                        writer.writerow(row)
+                        new_records += 1
+                        existing_records.add(record_key)
+
+            self.logger.info(f"Se agregaron {new_records} nuevos registros al archivo {filename}")
+        except Exception as e:
+            self.logger.error(f"Error al guardar CSV: {e}")
+
+    def guardar_resultados(self, resultados, nombre_archivo="resultados_hechos.json"):
+        try:
+            with open(nombre_archivo, 'w', encoding='utf-8') as f:
+                json.dump(resultados, f, ensure_ascii=False, indent=4)
+            self.logger.info(f"Resultados guardados exitosamente en {nombre_archivo}")
+        except Exception as e:
+            self.logger.error(f"Error al guardar los resultados: {e}")
+
+    def cargar_resultados_existentes(self):
+        try:
+            with open('resultados_hechos.json', 'r', encoding='utf-8') as f:
+                resultados = json.load(f)
+                self.logger.info(f"Cargados {len(resultados)} resultados existentes")
+                return resultados
+        except FileNotFoundError:
+            self.logger.info("No se encontraron resultados previos")
+            return {}
+
+class DocumentDownloader:
+    def __init__(self, logger):
+        self.logger = logger
+        self.session = requests.Session()
+        self.user_agents = [
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+        ]
+        self.current_agent_index = 0
+        self.download_attempts = {}
+
+    def _get_next_user_agent(self):
+        self.current_agent_index = (self.current_agent_index + 1) % len(self.user_agents)
+        return self.user_agents[self.current_agent_index]
+
+    def _get_filename_from_response(self, response):
+        # Intentar obtener el nombre del archivo del header Content-Disposition
+        content_disposition = response.headers.get('content-disposition')
+        if content_disposition:
+            import re
+            # Buscar tanto filename como filename*
+            filename_match = re.search(r'filename[^;=\n]*=([^;\n]*)', content_disposition)
+            if filename_match:
+                filename = filename_match.group(1).strip('"').strip("'")
+                # Decodificar si es necesario
+                try:
+                    filename = filename.encode('latin1').decode('utf-8')
+                except:
+                    pass
+                return filename
+
+        # Si no está en el header, intentar obtenerlo de la URL
+        url_path = urlparse(response.url).path
+        if url_path:
+            filename = os.path.basename(url_path)
+            if filename:
+                return filename
+
+        # Si no se puede obtener el nombre, usar el timestamp y la extensión correcta
+        content_type = response.headers.get('content-type', '').lower()
+        extension = self._get_extension_from_content_type(content_type)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return f"documento_{timestamp}{extension}"
+
+    def _get_extension_from_content_type(self, content_type):
+        content_type = content_type.lower()
+        extension_map = {
+            'application/pdf': '.pdf',
+            'application/msword': '.doc',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+            'application/vnd.ms-excel': '.xls',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+            'application/zip': '.zip',
+            'application/x-rar-compressed': '.rar',
+            'text/plain': '.txt',
+            'image/jpeg': '.jpg',
+            'image/png': '.png'
+        }
+        return extension_map.get(content_type, '.dat')
+
+    def descargar_documentos(self, hechos):
+        docs_dir = "documentos_hechos"
+        if not os.path.exists(docs_dir):
+            os.makedirs(docs_dir)
+        
+        total_documentos = sum(len(hecho["documentos"]) for hecho in hechos)
+        documentos_procesados = 0
+        documentos_fallidos = []
+        
+        self.logger.info(f"Iniciando descarga de {total_documentos} documentos totales")
+        
+        for hecho in hechos:
+            empresa_dir = os.path.join(docs_dir, hecho["empresa"].replace("/", "-"))
+            if not os.path.exists(empresa_dir):
+                os.makedirs(empresa_dir)
+            
+            # Crear un subdirectorio para el expediente
+            expediente_sanitizado = hecho["expediente"].replace("/", "-").replace(":", "").replace(" ", "_")
+            expediente_dir = os.path.join(empresa_dir, expediente_sanitizado)
+            if not os.path.exists(expediente_dir):
+                os.makedirs(expediente_dir)
+            
+            # Procesar todos los documentos del hecho actual
+            docs_hecho_actual = []
+            for doc in hecho["documentos"]:
+                documentos_procesados += 1
+                self.logger.info(f"Procesando documento {documentos_procesados}/{total_documentos} del expediente {expediente_sanitizado}")
+                
+                success = self._descargar_documento(doc, expediente_dir)
+                if not success:
+                    documentos_fallidos.append({
+                        "empresa": hecho["empresa"],
+                        "expediente": hecho["expediente"],
+                        "url": doc["url"],
+                        "fecha": doc["fecha"]
+                    })
+                else:
+                    docs_hecho_actual.append(doc["url"])
+            
+            self.logger.info(f"Completada la descarga de {len(docs_hecho_actual)}/{len(hecho['documentos'])} documentos del expediente {expediente_sanitizado}")
+
+        # Reintentar documentos fallidos
+        if documentos_fallidos:
+            self.logger.info(f"Reintentando descarga de {len(documentos_fallidos)} documentos fallidos...")
+            for doc_fallido in documentos_fallidos:
+                expediente_dir = os.path.join(
+                    docs_dir, 
+                    doc_fallido["empresa"].replace("/", "-"),
+                    doc_fallido["expediente"].replace("/", "-").replace(":", "").replace(" ", "_")
+                )
+                self._descargar_documento(
+                    {"url": doc_fallido["url"], "fecha": doc_fallido["fecha"]}, 
+                    expediente_dir,
+                    is_retry=True
+                )
+
+    def _descargar_documento(self, doc, expediente_dir, is_retry=False, max_attempts=3):
+        url = doc["url"]
+        if url in self.download_attempts:
+            if self.download_attempts[url] >= max_attempts:
+                self.logger.warning(f"Máximo de intentos alcanzado para {url}")
+                return False
+            self.download_attempts[url] += 1
+        else:
+            self.download_attempts[url] = 1
+
+        try:
+            headers = {
+                'User-Agent': self._get_next_user_agent(),
+                'Accept': '*/*'  # Aceptar cualquier tipo de contenido
+            }
+            
+            # Primera solicitud para obtener el archivo
+            response = self.session.get(
+                url, 
+                headers=headers, 
+                stream=True,
+                allow_redirects=True,
+                timeout=30
+            )
+            response.raise_for_status()
+            
+            # Obtener el nombre del archivo y su extensión
+            filename = self._get_filename_from_response(response)
+            filepath = os.path.join(expediente_dir, filename)
+            
+            # Si el archivo ya existe, agregar un sufijo numérico
+            base, ext = os.path.splitext(filepath)
+            counter = 1
+            while os.path.exists(filepath):
+                filepath = f"{base}_{counter}{ext}"
+                counter += 1
+            
+            # Guardar el archivo
+            self._guardar_archivo(response, filepath)
+            
+            # Verificar que el archivo se guardó correctamente
+            if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                self.logger.info(f"Documento descargado: {filepath}")
+                return True
+            else:
+                raise Exception("El archivo descargado está vacío o no se guardó correctamente")
+            
+        except Exception as e:
+            self.logger.error(f"Error al descargar documento {url}: {e}")
+            if not is_retry:
+                return False
+            else:
+                time.sleep(5)
+                return self._descargar_documento(doc, expediente_dir, is_retry=True)
+
+    def _guardar_archivo(self, response, filepath):
+        total_size = 0
+        try:
+            with open(filepath, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        total_size += len(chunk)
+            
+            # Verificar que el archivo no esté vacío
+            if total_size == 0:
+                os.remove(filepath)
+                raise Exception("El archivo descargado está vacío")
+            
+            # Verificar que el archivo se puede abrir
+            with open(filepath, 'rb') as f:
+                f.read(1)
+            
+        except Exception as e:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            raise Exception(f"Error al guardar el archivo: {str(e)}")
+
+class SMVScraper:
+    def __init__(self):
+        self.logger = Logger().logger
+        self.driver_manager = WebDriverManager(self.logger)
+        self.data_manager = DataManager(self.logger)
+        self.doc_downloader = DocumentDownloader(self.logger)
+        self.driver = None
+
+    def iniciar_scraping(self, url):
+        self.driver = self.driver_manager.setup_driver()
+        resultados = {}
+        
+        try:
+            self.driver.get(url)
+            time.sleep(3)
+            
+            empresas = self._obtener_lista_empresas()
+            resultados = self.data_manager.cargar_resultados_existentes()
+            
+            for empresa in empresas:
+                if empresa in resultados:
+                    self.logger.info(f"Saltando empresa ya procesada: {empresa}")
+                    continue
+                    
+                try:
+                    self.logger.info(f"\n{'='*50}\nProcesando empresa: {empresa}\n{'='*50}")
+                    hechos = self._procesar_empresa(empresa, url)
+                    
+                    if hechos:
+                        resultados[empresa] = hechos
+                        self.data_manager.guardar_resultados(resultados)
+                        self.data_manager.guardar_en_csv(hechos)
+                        self.doc_downloader.descargar_documentos(hechos)
+                        
+                        self.logger.info(f"Resultados para {empresa}:")
+                        self.logger.info(f"- Hechos encontrados: {len(hechos)}")
+                    else:
+                        self.logger.warning(f"No se encontraron hechos para {empresa}")
+                    
+                except Exception as e:
+                    self.logger.error(f"Error procesando empresa {empresa}: {e}")
+                    continue
+                
+        except Exception as e:
+            self.logger.error(f"Error en el proceso general: {e}")
+        finally:
+            self.driver_manager.quit()
+        
+        return resultados
+
+    def _obtener_lista_empresas(self):
+        try:
+            select_empresa = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "MainContent_cboDenominacionSocial"))
+            )
+            options = select_empresa.find_elements(By.TAG_NAME, "option")[1:]
+            empresas = [option.text for option in options]
+            self.logger.info(f"Se encontraron {len(empresas)} empresas en el combo box")
+            return empresas
+        except Exception as e:
+            self.logger.error(f"Error al obtener lista de empresas: {e}")
+            return []
+
+    def _procesar_empresa(self, empresa, url):
+        self.logger.info(f"Iniciando procesamiento para la empresa: {empresa}")
+        try:
+            self.driver.get(url)
+            self.logger.info("Página recargada para nueva búsqueda.")
+            
+            # Esperamos que la página cargue completamente
+            time.sleep(3)
+            
+            # Seleccionamos la empresa del combo box
+            for intento in range(3):
+                try:
+                    # Encontramos el select
+                    select_empresa = WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.ID, "MainContent_cboDenominacionSocial"))
+                    )
+                    
+                    # Buscamos la opción que contiene el texto exacto de la empresa
+                    options = select_empresa.find_elements(By.TAG_NAME, "option")
+                    empresa_option = None
+                    for option in options:
+                        if option.text == empresa:
+                            empresa_option = option
+                            break
+                    
+                    if empresa_option:
+                        # Hacemos clic en la opción usando el método nativo de Selenium
+                        empresa_option.click()
+                        
+                        # También disparamos el evento específico que usa el sitio
+                        self.driver.execute_script(
+                            "DisplayText(); setTimeout('__doPostBack(\\'ctl00$MainContent$cboDenominacionSocial\\',\\'\\')', 0)"
+                        )
+                        
+                        self.logger.info(f"Empresa '{empresa}' seleccionada del combo box.")
+                        
+                        # Esperamos a que se complete el postback
+                        time.sleep(3)
+                        
+                        # Verificamos que la selección fue exitosa
+                        textbox = WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located((By.ID, "MainContent_TextBox2"))
+                        )
+                        
+                        if textbox.get_attribute('value') == empresa:
+                            self.logger.info("Selección de empresa confirmada.")
+                            break
+                        else:
+                            raise Exception("La selección de empresa no se reflejó correctamente")
+                    else:
+                        self.logger.warning(f"No se encontró la empresa '{empresa}' en el combo box.")
+                        time.sleep(1)
+                except Exception as e:
+                    self.logger.warning(f"Error al seleccionar empresa (intento {intento + 1}): {e}")
+                    time.sleep(1)
+                    continue
+            else:
+                raise Exception("No se pudo seleccionar la empresa después de varios intentos")
+
+            # Ejecutamos el flujo del modal para seleccionar Tipo de Hecho
+            self._select_tipo_hecho_modal()
+
+            time.sleep(2)
+
+            # Ingresamos las fechas
+            fecha_desde = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "txtFechDesde"))
+            )
+            fecha_desde.clear()
+            fecha_desde.send_keys("01/01/2024")
+            # Hacemos clic fuera del campo para cerrar el calendario
+            self.driver.execute_script("arguments[0].blur();", fecha_desde)
+            self.logger.info("Fecha de inicio ingresada.")
+            
+            time.sleep(1)
+
+            fecha_hasta = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "txtFechHasta"))
+            )
+            fecha_hasta.clear()
+            fecha_hasta.send_keys("31/12/2024")
+            # Hacemos clic fuera del campo para cerrar el calendario
+            self.driver.execute_script("arguments[0].blur();", fecha_hasta)
+            self.logger.info("Fecha de término ingresada.")
+
+            time.sleep(1)
+
+            # Hacemos clic en el botón Buscar usando JavaScript
+            buscar_button = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "MainContent_btnBuscar"))
+            )
+            self.driver.execute_script("arguments[0].click();", buscar_button)
+            self.logger.info("Botón Buscar clickeado.")
+
+            # Esperamos que se actualice la tabla de resultados
+            time.sleep(10)
+            hechos = self._extraer_hechos()
+            self.logger.info(f"Se extrajeron {len(hechos)} hechos para {empresa}")
+            return hechos
+        except Exception as e:
+            self.logger.error(f"Error en el procesamiento de la empresa {empresa}: {e}")
+            return []
+
+    def _extraer_hechos(self):
+        hechos = []
+        try:
+            # Esperamos que la tabla de resultados esté presente
+            WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "MainContent_grdHechosImportancia2"))
+            )
+            
+            # Encontramos todas las empresas
+            empresas = self.driver.find_elements(By.CLASS_NAME, "titulo-empresa-azul")
+            
+            for empresa in empresas:
+                nombre_empresa = empresa.text
+                
+                # Encontramos todas las cards de hechos para esta empresa
+                cards = self.driver.find_elements(By.CLASS_NAME, "card-custom")
+                
+                for card in cards:
+                    try:
+                        # Extraemos la información básica
+                        expediente = card.find_element(By.CLASS_NAME, "text-blue").text
+                        titulo = card.find_element(By.CLASS_NAME, "card-title").text
+                        fecha_acuerdo = card.find_element(By.CLASS_NAME, "small").text.replace("Fecha de acuerdo:", "").strip()
+                        descripcion = card.find_element(By.CLASS_NAME, "card-text").text
+                        
+                        # Extraemos los links de documentos
+                        documentos = []
+                        try:
+                            # Buscamos el div que contiene todos los documentos
+                            adjuntos_div = card.find_element(By.CLASS_NAME, "archivos-adjuntos")
+                            
+                            # Buscamos todos los divs de archivos individuales
+                            archivos_divs = adjuntos_div.find_elements(By.CLASS_NAME, "archivos-div")
+                            self.logger.info(f"Encontrados {len(archivos_divs)} documentos en el hecho {expediente}")
+                            
+                            for i, archivo_div in enumerate(archivos_divs, 1):
+                                try:
+                                    # Encontrar el link dentro del div actual
+                                    link = archivo_div.find_element(By.TAG_NAME, "a")
+                                    doc_url = link.get_attribute("href")
+                                    
+                                    # Encontrar la fecha dentro del div actual
+                                    fecha_div = archivo_div.find_element(By.CLASS_NAME, "fecha-adjunto")
+                                    fecha_elementos = fecha_div.find_elements(By.TAG_NAME, "div")
+                                    fecha_doc = f"{fecha_elementos[0].text} {fecha_elementos[1].text}"
+                                    
+                                    documentos.append({
+                                        "url": doc_url,
+                                        "fecha": fecha_doc
+                                    })
+                                    self.logger.debug(f"Documento {i}/{len(archivos_divs)} procesado: {doc_url}")
+                                except Exception as e:
+                                    self.logger.error(f"Error procesando documento {i} del hecho {expediente}: {e}")
+                                    continue
+                                
+                        except NoSuchElementException:
+                            self.logger.warning(f"No se encontraron documentos adjuntos para el hecho {expediente}")
+                        
+                        hecho = {
+                            "empresa": nombre_empresa,
+                            "expediente": expediente,
+                            "titulo": titulo,
+                            "fecha_acuerdo": fecha_acuerdo,
+                            "descripcion": descripcion,
+                            "documentos": documentos
+                        }
+                        hechos.append(hecho)
+                        self.logger.info(f"Hecho {expediente} procesado con {len(documentos)} documentos")
+                        
+                    except Exception as e:
+                        self.logger.warning(f"Error al procesar una card: {e}")
+                        continue
+            
+            self.logger.info(f"Se extrajeron {len(hechos)} hechos exitosamente")
+            
+            # Guardamos en CSV
+            self.data_manager.guardar_en_csv(hechos)
+            
+            # Descargamos los documentos
+            self.doc_downloader.descargar_documentos(hechos)
+            
+            return hechos
+            
+        except Exception as e:
+            self.logger.error(f"Error al extraer hechos: {e}")
+            return []
+
+    def _select_tipo_hecho_modal(self):
+        try:
+            max_retries = 3
+            retry_count = 0
+            modal_visible = False
+            
+            while retry_count < max_retries and not modal_visible:
+                try:
+                    # Limpiar cualquier modal existente
+                    self.driver.execute_script("""
+                        var modals = document.querySelectorAll('.modal');
+                        modals.forEach(function(modal) {
+                            modal.style.display = 'none';
+                        });
+                    """)
+                    
+                    # Esperar un momento antes de hacer clic
+                    time.sleep(1)
+                    
+                    # Intentar hacer clic en el botón
+                    tipo_button = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.ID, "MainContent_ImageButton1"))
+                    )
+                    self.driver.execute_script("arguments[0].scrollIntoView(true);", tipo_button)
+                    time.sleep(0.5)  # Pequeña pausa después del scroll
+                    self.driver.execute_script("arguments[0].click();", tipo_button)
+                    
+                    # Esperar que el modal sea visible
+                    modal = WebDriverWait(self.driver, 5).until(
+                        EC.visibility_of_element_located((By.ID, "myModalTH"))
+                    )
+                    
+                    # Verificar si el modal está realmente visible
+                    modal_visible = self.driver.execute_script(
+                        "return window.getComputedStyle(arguments[0]).display !== 'none'", 
+                        modal
+                    )
+                    
+                    if modal_visible:
+                        self.logger.info("Modal visible correctamente")
+                        break
+                        
+                except Exception as e:
+                    retry_count += 1
+                    self.logger.warning(f"Intento {retry_count}: Error al abrir modal - {str(e)}")
+                    time.sleep(2)  # Esperar antes de reintentar
+            
+            if not modal_visible:
+                raise Exception("No se pudo mostrar el modal después de varios intentos")
+
+            # Definir los tipos a seleccionar
+            tipos_a_seleccionar = [
+                "L01 1. Convocatoria a juntas de accionistas, junta de acreedores o asamblea de obligacionistas, y acuerdos adoptados.",
+                "H01 Convocatoria a Asamblea de participes de fondos de inversión, así como los acuerdos."
+            ]
+            seleccionados = {tipo: False for tipo in tipos_a_seleccionar}
+
+            # Esperar a que la tabla esté presente y visible
+            tabla = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "MainContent_grdTh"))
+            )
+            
+            # Asegurarse de que la tabla es interactuable
+            self.driver.execute_script("arguments[0].scrollIntoView(true);", tabla)
+            time.sleep(0.5)
+
+            for intento in range(3):
+                try:
+                    rows = WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_all_elements_located(
+                            (By.XPATH, "//table[@id='MainContent_grdTh']//tr[contains(@class,'item-grid')]")
+                        )
+                    )
+                    
+                    for row in rows:
+                        try:
+                            cols = row.find_elements(By.TAG_NAME, "td")
+                            if len(cols) < 2:
+                                continue
+                                
+                            texto = cols[1].text.strip()
+                            for tipo in tipos_a_seleccionar:
+                                if tipo in texto and not seleccionados[tipo]:
+                                    checkbox = cols[0].find_element(By.XPATH, ".//input[@type='checkbox']")
+                                    # Scroll al checkbox
+                                    self.driver.execute_script("arguments[0].scrollIntoView(true);", checkbox)
+                                    time.sleep(0.5)
+                                    # Intentar clic con JavaScript
+                                    self.driver.execute_script("arguments[0].click();", checkbox)
+                                    seleccionados[tipo] = True
+                                    self.logger.info(f"Tipo '{tipo}' seleccionado.")
+                        except Exception as e:
+                            self.logger.warning(f"Error al procesar fila: {e}")
+                            continue
+
+                    if all(seleccionados.values()):
+                        break
+                        
+                except Exception as e:
+                    self.logger.warning(f"Error en intento {intento+1}: {e}")
+                    time.sleep(1)
+
+            # Verificar selecciones
+            for tipo, sel in seleccionados.items():
+                if not sel:
+                    self.logger.error(f"No se pudo seleccionar el tipo: {tipo}")
+
+            # Cerrar modal con reintento
+            for _ in range(3):
+                try:
+                    aceptar_button = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable(
+                            (By.XPATH, "//div[@id='myModalTH']//button[span[text()='Aceptar']]")
+                        )
+                    )
+                    self.driver.execute_script("arguments[0].scrollIntoView(true);", aceptar_button)
+                    time.sleep(0.5)
+                    self.driver.execute_script("arguments[0].click();", aceptar_button)
+                    
+                    # Esperar a que el modal desaparezca
+                    WebDriverWait(self.driver, 10).until(
+                        EC.invisibility_of_element_located((By.ID, "myModalTH"))
+                    )
+                    self.logger.info("Modal cerrado exitosamente.")
+                    return True
+                    
+                except Exception as e:
+                    self.logger.warning(f"Reintentando cerrar modal: {e}")
+                    time.sleep(1)
+
+            raise Exception("No se pudo cerrar el modal correctamente")
+
+        except Exception as e:
+            self.logger.error(f"Error en el flujo del modal: {str(e)}")
+            # En lugar de terminar el programa, lanzamos la excepción para manejarla en el nivel superior
+            raise
+
+def main():
+    URL = "https://www.smv.gob.pe/SIMV/Frm_HechosDeImportancia?data=AEC85625CCC24CEF792DAE7794ED2132F7CFCB8B1C"
+    scraper = SMVScraper()
+    resultados = scraper.iniciar_scraping(URL)
+
+if __name__ == "__main__":
+    main()
